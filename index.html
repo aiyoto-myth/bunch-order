@@ -272,11 +272,13 @@ var BO = (function(){
     opts = opts || {};
     var evs = byDate(events), per = needs(evs), total = {};
     Object.keys(per).forEach(function(eid){ var m = per[eid]; Object.keys(m).forEach(function(fid){ total[fid] = (total[fid] || 0) + m[fid]; }); });
-    var lines = [], units = {bunch: 0, box: 0, stem: 0}, cost = 0, unpriced = 0, noSize = 0, sepUnits = 0, sepCost = 0, togUnits = 0, togCost = 0;
+    var lines = [], units = {bunch: 0, box: 0, stem: 0}, cost = 0, unpriced = 0, noSize = 0, sepCost = 0, togCost = 0;
+    var sepU = {bunch: 0, box: 0, stem: 0}, togU = {bunch: 0, box: 0, stem: 0};
     var evCost = {}; evs.forEach(function(e){ evCost[e.id] = 0; });
     (flowers || []).forEach(function(f){
       var need = total[f.id] || 0; if(!need) return;
-      var u = unitOf(f), s = sizeOf(f), price = priceOf(f), buf = bufOf(f, opts.buf), onhand = int0(f.onhand);
+      var u = unitOf(f), s = sizeOf(f), price = priceOf(f), buf = bufOf(f, opts.buf);
+      var onhand = (opts.onhand && opts.onhand[f.id] !== undefined) ? int0(opts.onhand[f.id]) : int0(f.onhand);
       var wb = withBuf(need, buf), used = Math.min(onhand, wb), toBuy = wb - used;
       var line = {f: f.id, name: f.name || '', group: f.group || 'flowers', supplier: String(f.supplier || '').trim(), unit: u, size: s, buf: buf,
                   need: need, withBuf: wb, bufStems: wb - need, onhand: onhand, onhandUsed: used, toBuy: toBuy, price: price, noSize: !s};
@@ -291,14 +293,20 @@ var BO = (function(){
       // one event at a time, in date order, each using what is left in the cooler
       var rem = onhand, su = 0;
       evs.forEach(function(e){ var n = per[e.id][f.id] || 0; if(!n) return; var w = withBuf(n, buf), take = Math.min(rem, w); rem -= take; su += Math.ceil((w - take) / s); });
-      sepUnits += su; togUnits += line.units;
+      sepU[u] += su; togU[u] += line.units;
       if(price !== null){ sepCost += su * price; togCost += line.units * price; }
-      lines.push(line);
+      line.buf = buf; lines.push(line);
     });
+    // cents split by largest remainder so the event costs add up to the order to the cent
+    var cents100 = Math.round(cost * 100), raw = evs.map(function(e){ return (evCost[e.id] || 0) * 100; }), fl = raw.map(Math.floor);
+    var left = cents100 - fl.reduce(function(a, b){ return a + b; }, 0);
+    raw.map(function(r, i){ return {i: i, frac: r - fl[i]}; }).sort(function(a, b){ return b.frac - a.frac || a.i - b.i; })
+      .forEach(function(o){ if(left > 0){ fl[o.i]++; left--; } });
+    evs.forEach(function(e, i){ evCost[e.id] = fl[i] / 100; });
     var evOut = evs.map(function(e){
       var m = per[e.id] || {}, stems = 0, un = 0;
       Object.keys(m).forEach(function(fid){ stems += m[fid]; var l = lines.filter(function(x){ return x.f === fid; })[0]; if(!l || l.cost === null) un++; });
-      return {id: e.id, name: e.name || '', date: e.date || '', stems: stems, cost: cents(evCost[e.id] || 0), unpriced: un};
+      return {id: e.id, name: e.name || '', date: e.date || '', stems: stems, cost: evCost[e.id] || 0, unpriced: un};
     });
     var priced = lines.filter(function(l){ return l.cost !== null; });
     return {lines: lines, events: evOut, units: units, cost: cents(cost), unpriced: unpriced, noSize: noSize,
@@ -306,8 +314,9 @@ var BO = (function(){
             extra: lines.reduce(function(a, l){ return a + (l.extra || 0); }, 0),
             // part of the order cost that buys buffer + rounding stems (cooler stems go into recipes first)
             wasteValue: cents(priced.reduce(function(a, l){ return a + (l.bought - Math.max(0, l.need - l.onhand)) * l.perStem; }, 0)),
-            separate: {units: sepUnits, cost: cents(sepCost)}, together: {units: togUnits, cost: cents(togCost)},
-            saved: {units: sepUnits - togUnits, cost: cents(sepCost - togCost)}};
+            separate: {units: sepU, cost: cents(sepCost)}, together: {units: togU, cost: cents(togCost)},
+            saved: {units: {bunch: sepU.bunch - togU.bunch, box: sepU.box - togU.box, stem: sepU.stem - togU.stem}, cost: cents(sepCost - togCost),
+                    any: (sepU.bunch - togU.bunch) + (sepU.box - togU.box) + (sepU.stem - togU.stem) > 0}};
   }
 
   /* where the extra (rounding) stems of one flower could go: among pieces with 2+ copies that already use 3+ stems of it (so +1 is a
@@ -320,7 +329,9 @@ var BO = (function(){
         var q = int0(p.qty); if(q < 2 || q > line.extra) return;
         var n = 0; (p.recipe || []).forEach(function(r){ if(r.f === line.f) n += int0(r.n); });
         if(n < 3) return;
-        if(!best || q > best.qty) best = {piece: p.name || '', event: e.name || '', qty: q, each: Math.floor(line.extra / q)};
+        var have = line.bought + line.onhand, k = Math.floor(line.extra / q);
+        while(k > 0 && withBuf(line.need + q * k, line.buf) > have) k--;   // the added stems need their buffer too
+        if(k > 0 && (!best || q > best.qty)) best = {piece: p.name || '', event: e.name || '', qty: q, each: k};
       });
     });
     return best;
@@ -328,8 +339,10 @@ var BO = (function(){
 
   /* names: the same flower typed two ways should land on one line */
   function norm(name){
-    return String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(' ')
+    var raw = String(name || '').toLowerCase().trim();
+    var k = raw.replace(/[^a-z0-9]+/g, ' ').trim().split(' ')
       .map(function(w){ return w.length > 3 && /[^s]s$/.test(w) ? w.slice(0, -1) : w; }).join(' ');
+    return /[a-z0-9]/.test(k) ? k : raw.replace(/\s+/g, ' ');   // names with no Latin letters (芍药) compare as typed
   }
   function dist(a, b){   // Levenshtein, small strings only
     if(Math.abs(a.length - b.length) > 3) return 9;
@@ -338,15 +351,36 @@ var BO = (function(){
     return prev[b.length];
   }
   /* closest existing flower for a typed name: {f, exact} or null. exact = same after norm(); near = 1-2 letters off (names of 6+ letters) */
+  /* near = 1-2 letters off (5+ letters), or one name is the other's first word(s) ("Hydrangea" vs "Hydrangea, white").
+     Names whose numbers differ ("Rose 50cm" / "Rose 60cm") are never near. */
   function match(name, flowers){
     var k = norm(name); if(!k) return null;
-    var near = null, best = 9;
+    var near = null, best = 9, kw = k.split(' '), kd = (k.match(/\d+/g) || []).join(',');
     for(var i = 0; i < (flowers || []).length; i++){
       var m = norm(flowers[i].name); if(!m) continue;
       if(m === k) return {f: flowers[i], exact: true};
-      if(k.length >= 6){ var d = dist(k, m); if(d <= 2 && d < best){ best = d; near = flowers[i]; } }
+      if((m.match(/\d+/g) || []).join(',') !== kd) continue;
+      var mw = m.split(' '), d = 9;
+      if(k.length >= 5) d = dist(k, m);
+      if(d > 2 && k.length >= 4){   // compare the typed words with the same number of leading words of the existing name, and the other way round
+        var a = mw.slice(0, kw.length).join(' '), b = kw.slice(0, mw.length).join(' ');
+        if(a.length >= 4) d = Math.min(d, a === k ? 1.5 : (k.length >= 5 ? dist(k, a) + 1 : 9));
+        if(b.length >= 4) d = Math.min(d, b === m ? 1.5 : 9);
+      }
+      if(d <= 2.5 && d < best){ best = d; near = flowers[i]; }
     }
     return near ? {f: near, exact: false} : null;
+  }
+
+  /* cooler stems per event: events in date order each take what they need (with buffer) from what is left -> {eventId: {flowerId: stems}} */
+  function allocCooler(flowers, events, gbuf){
+    var evs = byDate(events), per = needs(evs), out = {};
+    (flowers || []).forEach(function(f){
+      var rem = int0(f.onhand), buf = bufOf(f, gbuf);
+      evs.forEach(function(e){ out[e.id] = out[e.id] || {}; var n = per[e.id][f.id] || 0, take = n ? Math.min(rem, withBuf(n, buf)) : 0; rem -= take; out[e.id][f.id] = take; });
+    });
+    evs.forEach(function(e){ out[e.id] = out[e.id] || {}; });
+    return out;
   }
 
   /* first guesses for a new flower (US wholesale habits); the page marks them "guess" until the florist edits them */
@@ -365,7 +399,7 @@ var BO = (function(){
     return {unit: 'bunch', size: 10};
   }
 
-  return {order: order, needs: needs, spareHint: spareHint, guessGroup: guessGroup, guessSale: guessSale, withBuf: withBuf, norm: norm, match: match,
+  return {order: order, needs: needs, spareHint: spareHint, allocCooler: allocCooler, guessGroup: guessGroup, guessSale: guessSale, withBuf: withBuf, norm: norm, match: match,
           byDate: byDate, GROUPS: ['roses', 'flowers', 'fillers', 'greens'], UNITS: UNITS};
 })();
 if(typeof module !== 'undefined') module.exports = BO;
@@ -393,7 +427,8 @@ var SRC = (function(){ try{
 }catch(e){ return ''; } })();
 var SELFTEST = SRC.indexOf('selftest') === 0;
 var FUNNEL_EV = {'tool-start':1, 'order-made':1, 'event-2':1, 'order-used':1, 'copy-order':1, 'print-order':1, 'print-make':1,
-                 'savings-shown':1, 'pro-view':1, 'pro-limit':1, 'buy-click':1, 'pro-unlocked':1, 'pro-gift':1, 'combine-used':1};
+                 'savings-shown':1, 'pro-view':1, 'pro-limit':1, 'limit-book':1, 'limit-combine':1, 'buy-click':1, 'bought-return':1,
+                 'pro-unlocked':1, 'pro-notfound':1, 'pro-gift':1, 'combine-used':1, 'book-save':1, 'new-week':1};
 var ONCE = {}, QUEUE = [], SENDING = false, GC_READY = 0;
 function track(name){
   try{
@@ -473,10 +508,13 @@ function valid(st){
 }
 var S = lsGet(KEY, null);
 if(!valid(S)) S = example();
+built = !S.example;
 var PRO = lsGet(PROKEY, null);
 function isPro(){ return !!(PRO && (PRO.email || PRO.gift)); }
+var autoScrolled = false;   // the page scrolled itself (?bought=1): not a Pro view
 var touched = false;   // the visitor changed something in this load (looking at the example is not use)
-var ownEdit = false;   // ...and it was a quantity, stems, a flower or a piece (not just a name): only then is an order "theirs"
+var ownEdit = false;   // ...and it was a quantity, stems, a flower or a piece (not just a name)
+var built = false;     // the visitor added a piece, a flower, an event or a recipe (or came back with their own data): only then is an order "theirs"
 function save(){ if(S.example) return; $('storeWarn').hidden = lsSet(KEY, S); }
 function changed(real){
   if(S.example){ S.example = false; $('exNote').hidden = true; }
@@ -494,7 +532,7 @@ function fmtDate(d){ if(!d) return ''; try{ return new Date(d + 'T12:00:00').toL
 function hasStems(e){ return Object.keys(BO.needs([e])[e.id]).length > 0; }
 function usesOf(fid){ var n = 0; S.events.forEach(function(e){ e.pieces.forEach(function(p){ p.recipe.forEach(function(r){ if(r.f === fid) n++; }); }); }); S.book.forEach(function(b){ b.recipe.forEach(function(r){ if(r.f === fid) n++; }); }); return n; }
 function unitWord(u, n){ return u === 'stem' ? (n === 1 ? 'stem' : 'stems') : u === 'box' ? (n === 1 ? 'box' : 'boxes') : (n === 1 ? 'bunch' : 'bunches'); }
-function unitsText(u){ var parts = []; ['bunch', 'box', 'stem'].forEach(function(k){ if(u[k]) parts.push(u[k] + ' ' + unitWord(k, u[k])); }); return parts.join(' + ') || '0 bunches'; }
+function unitsText(u){ var parts = []; ['bunch', 'box', 'stem'].forEach(function(k){ if(u[k] > 0) parts.push(u[k] + ' ' + unitWord(k, u[k])); }); return parts.join(' + ') || '0 bunches'; }
 function plural(name, n){ name = String(name); if(n === 1 || /s$/i.test(name)) return name; if(/[^aeiou]y$/i.test(name)) return name.slice(0, -1) + 'ies'; return name + (/(sh|ch|x|z)$/i.test(name) ? 'es' : 's'); }
 var toastT = 0;
 function say(t){ var el = $('toast'); el.textContent = t; el.hidden = false; clearTimeout(toastT); toastT = setTimeout(function(){ el.hidden = true; }, 3600); }
@@ -506,6 +544,15 @@ function keepFocus(fn){
   if(key){ try{ var b = document.querySelector(key); if(b && b !== a) b.focus(); }catch(e){} }
 }
 
+/* cooler stems this order may use: all of them when every event with stems is in it, otherwise what these events get when the cooler
+   goes to the week's events in date order (so ordering event by event never counts the same stems twice) */
+function coolerFor(evs){
+  var rest = S.events.filter(function(e){ return evs.indexOf(e) < 0 && hasStems(e); });
+  if(!rest.length) return null;
+  var al = BO.allocCooler(S.flowers, S.events, S.buf), m = {};
+  S.flowers.forEach(function(f){ m[f.id] = evs.reduce(function(a, e){ return a + ((al[e.id] || {})[f.id] || 0); }, 0); });
+  return m;
+}
 /* which events are in the order: free = the open event; Pro = ticked events (all by default) */
 function orderEvents(){
   if(!isPro()) return [ev()];
@@ -518,7 +565,7 @@ function renderTabs(){
   $('tabs').innerHTML = S.events.map(function(e){
     var on = e.id === S.sel;
     return '<button class="tab' + (on ? ' on' : '') + '" role="tab" aria-selected="' + on + '" data-tab="' + e.id + '">' + esc(evLabel(e)) + (e.date ? '<small>' + esc(fmtDate(e.date)) + '</small>' : '') + '</button>';
-  }).join('') + '<button class="tab add" id="btnAddEv" title="Add another event to this week">+ Event</button>';
+  }).join('') + '<button class="tab add" id="btnAddEv" title="Add another event to this week">+ Event</button>' + (S.example ? '' : '<button class="tab add" id="btnNewWeek" title="Clear the events, keep flowers, prices and recipes">New week</button>');
 }
 function renderSheet(){
   var e = ev(), others = S.events.filter(function(x){ return x !== e; });
@@ -538,13 +585,13 @@ function renderSheet(){
       }).join('') + '</div>' +
       '<div class="pfoot"><button class="link" data-radd="' + p.id + '">+ Flower</button>' +
       '<button class="link" data-pbook="' + p.id + '">Save to recipe book</button>' +
-      '<select data-pcopy="' + p.id + '" aria-label="Copy this piece to an event"><option value="">Copy to…</option><option value="' + e.id + '">this event</option>' +
-        others.map(function(o){ return '<option value="' + o.id + '">' + esc(evLabel(o)) + '</option>'; }).join('') + '<option value="_new">a new event</option></select>' +
+      '<span>Copy to <select data-pcopyto="' + p.id + '" aria-label="Copy this piece to">' + others.map(function(o){ return '<option value="' + o.id + '">' + esc(evLabel(o)) + '</option>'; }).join('') +
+        '<option value="' + e.id + '">this event</option><option value="_new">a new event</option></select> <button class="link" data-pcopy="' + p.id + '">Copy</button></span>' +
       '<span class="stems" data-pst="' + p.id + '"></span></div></div>';
   }).join('');
   h += '<div class="addrow"><button class="btn small" id="btnAddPiece">+ Piece</button>' +
-    (S.book.length ? '<select id="selBook" aria-label="Add a piece from your recipe book"><option value="">+ From recipe book (' + S.book.length + ')</option>' +
-      S.book.map(function(b){ return '<option value="' + b.id + '">' + esc(b.name || 'Unnamed recipe') + '</option>'; }).join('') + '</select>' : '') + '</div>';
+    (S.book.length ? '<span>Recipe book (' + S.book.length + (isPro() ? '' : ' of ' + FREE_BOOK) + '): <select id="selBook" aria-label="Recipe from your recipe book">' +
+      S.book.map(function(b){ return '<option value="' + b.id + '">' + esc(b.name || 'Unnamed recipe') + '</option>'; }).join('') + '</select> <button class="btn small" id="btnBookAdd">Add to this event</button> <button class="link" id="btnBookDel">Remove from book</button></span>' : '') + '</div>';
   $('sheet').innerHTML = h;
   pieceStems();
 }
@@ -577,14 +624,19 @@ function renderFlowers(){
 }
 
 /* ---------- render: the order pad (cheap, runs on every keystroke) ---------- */
-var lastOrder = null;
-function supplierBlocks(lines){   // [{sup, lines}] in first-seen order; one block with sup '' when no supplier is set anywhere
-  var any = lines.some(function(l){ return l.supplier; }), order = [], by = {};
-  lines.forEach(function(l){ var k = any ? (l.supplier || 'No supplier set') : ''; if(!by[k]){ by[k] = []; order.push(k); } by[k].push(l); });
-  return order.map(function(k){ return {sup: k, lines: by[k]}; });
+var lastOrder = null, pickedOrder = false;
+function supLabel(key, fallback){   // the way the florist usually writes this supplier: a spelling with capitals wins
+  var best = ''; S.flowers.forEach(function(f){ var v = String(f.supplier || '').trim().replace(/\s+/g, ' '); if(v.toLowerCase() === key && (!best || (/[A-Z]/.test(v) && !/[A-Z]/.test(best)))) best = v; });
+  return best || fallback;
+}
+function supplierBlocks(lines){   // [{sup, lines}] in first-seen order, "Mayesh" = "mayesh"; one block with sup '' when no supplier is set anywhere
+  var any = lines.some(function(l){ return l.supplier; }), order = [], by = {}, label = {};
+  lines.forEach(function(l){ var k = any ? (l.supplier.toLowerCase().replace(/\s+/g, ' ') || '~none') : ''; if(!by[k]){ by[k] = []; order.push(k); label[k] = k === '~none' ? 'No supplier set' : supLabel(k, l.supplier); } by[k].push(l); });
+  order.sort(function(a, b){ return (a === '~none') - (b === '~none'); });
+  return order.map(function(k){ return {sup: label[k] || '', key: k, lines: by[k]}; });
 }
 function renderPad(){
-  var evs = orderEvents(), o = BO.order(S.flowers, evs, {buf: S.buf}); lastOrder = o;
+  var evs = orderEvents(), o = BO.order(S.flowers, evs, {buf: S.buf, onhand: coolerFor(evs)}); lastOrder = o;
   var pro = isPro(), multi = evs.length > 1, odOpen = $('odet') ? $('odet').open : false;
   var h = '<div class="padhead"><h2>Wholesale order</h2>';
   if(pro && S.events.length > 1){
@@ -621,15 +673,17 @@ function renderPad(){
     }
   }
   h += saveBox(evs);
-  var dis = o.lines.length ? '' : ' disabled';
-  h += '<div class="actions"><button class="btn dark" id="btnCopy"' + dis + '>Copy for wholesaler</button><button class="btn" id="btnPrint"' + dis + '>Print order</button><button class="btn" id="btnMake"' + dis + '>Print make sheets</button></div>';
+  var dis = o.lines.length ? '' : ' disabled', blocks = supplierBlocks(o.lines);
+  h += '<div class="actions">' + (blocks.length > 1 ? blocks.map(function(b){ return '<button class="btn dark" data-copysup="' + esc(b.key) + '">Copy ' + esc(b.key === '~none' ? 'unassigned' : b.sup) + ' order</button>'; }).join('') : '<button class="btn dark" id="btnCopy"' + dis + '>Copy for wholesaler</button>') +
+    '<button class="btn" id="btnPrint"' + dis + '>Print order</button><button class="btn" id="btnMake"' + dis + '>Print make sheets</button></div>';
   keepFocus(function(){ $('padIn').innerHTML = h; });
   $('mbarN').textContent = unitsText(o.units); $('mbarC').textContent = o.cost ? money(o.cost) : '';
-  if(ownEdit && o.lines.length) trackOnce('order-made');
+  if(built && ownEdit && o.lines.length) trackOnce('order-made');
 }
 function lineHTML(l, evs, multi){
   var f = flower(l.f), hint = BO.spareHint(l, evs);
-  var why = l.need + ' needed' + (l.buf ? ' + ' + l.buf + '% = ' + l.withBuf : '') + (l.onhandUsed ? ', ' + l.onhandUsed + ' from your cooler' : '') + (l.unit === 'stem' ? '' : ' · ' + (l.size ? l.size : '?') + '/' + l.unit);
+  var fo = f ? (+f.onhand || 0) : 0, share = fo && l.onhand < fo ? ' (' + (fo - l.onhand) + ' of your ' + fo + ' cooler stems go to other events this week)' : '';
+  var why = l.need + ' needed' + (l.buf ? ' + ' + l.buf + '% = ' + l.withBuf : '') + (l.onhandUsed ? ', ' + l.onhandUsed + ' from your cooler' : '') + share + (l.unit === 'stem' ? '' : ' · ' + (l.size ? l.size : '?') + '/' + l.unit);
   var sp = l.noSize ? '<span style="color:var(--warn);font-weight:700">set stems per ' + l.unit + '</span>' :
     (l.bufStems ? l.bufStems + ' buffer' : 'no buffer') + ' · ' + (l.extra > 0 ? '<span class="sp">' + l.extra + ' extra</span>' + (hint ? ' (enough for +' + hint.each + ' in each of the ' + hint.qty + ' ' + esc(plural(hint.piece || 'piece', hint.qty).toLowerCase()) + (multi && hint.event ? ', ' + esc(hint.event) : '') + ')' : '') : 'no extra');
   var ring = l.noSize ? '<div class="ring q"><b>?</b><i>' + l.unit + '</i></div>' :
@@ -643,18 +697,18 @@ function saveBox(evs){
   if(isPro()){
     if(evs.length < 2) return '';
     var o = lastOrder;
-    if(o.saved.units > 0) trackOnce('combine-used');
-    return '<div class="save got"><div class="big">' + (o.saved.units > 0 ? 'Together saves ' + o.saved.units + ' ' + (o.saved.units > 1 ? 'bunches' : 'bunch') + (o.saved.cost > 0 ? ' (' + esc(money(o.saved.cost)) + ')' : '') : 'One order for ' + evs.length + ' events') + '</div>' +
-      '<div style="font-size:14px">One event at a time: ' + o.separate.units + ' to order. Together: ' + o.together.units + '.</div></div>';
+    if(o.saved.any && (ownEdit || pickedOrder)) trackOnce('combine-used');
+    return '<div class="save got"><div class="big">' + (o.saved.any ? 'Together saves ' + esc(unitsText(o.saved.units)) + (o.saved.cost > 0 ? ' (' + esc(money(o.saved.cost)) + ')' : '') : 'One order for ' + evs.length + ' events') + '</div>' +
+      '<div style="font-size:14px">One event at a time: ' + esc(unitsText(o.separate.units)) + '. Together: ' + esc(unitsText(o.together.units)) + '.</div></div>';
   }
   var withStems = S.events.filter(hasStems);
   if(withStems.length < 2) return '';
   var all = BO.order(S.flowers, withStems, {buf: S.buf});
-  if(all.saved.units <= 0) return '<div class="save"><div style="font-size:14px">Your ' + withStems.length + ' events round the same together or apart. Pro still gives you one order, each event\'s true cost and every make sheet in one go.</div>' +
+  if(!all.saved.any) return '<div class="save"><div style="font-size:14px">Your ' + withStems.length + ' events round the same together or apart. Pro still gives you one order, each event\'s true cost and every make sheet in one go.</div>' +
     '<div class="row" style="margin-top:8px"><button class="btn small" data-gopro="1">About Pro</button></div></div>';
-  if(ownEdit) trackOnce('savings-shown');
-  return '<div class="save"><div class="big">Ordering your ' + withStems.length + ' events together saves ' + all.saved.units + ' ' + (all.saved.units > 1 ? 'bunches' : 'bunch') + (all.saved.cost > 0 ? ' (' + esc(money(all.saved.cost)) + ')' : '') + '</div>' +
-    '<div style="font-size:14px;margin-top:4px">One at a time: ' + all.separate.units + ' to order. Together: ' + all.together.units + '. Pro puts them in one order and splits the cost back to each event.</div>' +
+  if(built && ownEdit) trackOnce('savings-shown');
+  return '<div class="save"><div class="big">Ordering your ' + withStems.length + ' events together saves ' + esc(unitsText(all.saved.units)) + (all.saved.cost > 0 ? ' (' + esc(money(all.saved.cost)) + ')' : '') + '</div>' +
+    '<div style="font-size:14px;margin-top:4px">One at a time: ' + esc(unitsText(all.separate.units)) + '. Together: ' + esc(unitsText(all.together.units)) + '. Pro puts them in one order and splits the cost back to each event.</div>' +
     '<div class="row" style="margin-top:8px"><button class="btn pink small" data-gopro="combine">Combine them · ' + esc(PRICE) + ' once</button></div></div>';
 }
 
@@ -677,7 +731,8 @@ function renderPro(){
   $('btnBuy').href = buyUrl();
 }
 function buyUrl(){
-  var a = ''; try{ a = (new URLSearchParams(location.search).get('a') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40); }catch(e){}
+  var a = ''; try{ a = (new URLSearchParams(location.search).get('a') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
+    if(a) lsSet('bo.aff', {a: a, t: Date.now()}); else { var s = lsGet('bo.aff', null); if(s && s.a && Date.now() - s.t < 60 * 864e5) a = String(s.a).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40); } }catch(e){}
   return a ? CHECKOUT_PLAN + '?a=' + encodeURIComponent(a) : CHECKOUT_HOME;
 }
 function renderAll(){ $('exNote').hidden = !S.example; renderTabs(); renderSheet(); renderFlowers(); renderPad(); renderPro(); }
@@ -720,19 +775,24 @@ function today(){ try{ return new Date().toLocaleDateString(undefined, {year: 'n
 function evList(evs){ return BO.byDate(evs).map(function(e){ return evLabel(e) + (e.date ? ' (' + fmtDate(e.date) + ')' : ''); }).join(', '); }
 var SUBS = {ok: 'Subs OK', ask: 'Please ask me before substituting', no: 'No substitutions please'};
 /* what the wholesaler reads: who, when, subs, then each supplier's list by group. No couples' names. */
-function orderText(){
-  var o = lastOrder, t = 'Flower order' + (S.shop ? ' from ' + S.shop : '') + '\n';
+function orderText(only){   // only = a supplier key: that supplier's order alone, written to them
+  var o = lastOrder, blocks = supplierBlocks(o.lines.filter(function(l){ return l.noSize || l.units > 0; }));
+  if(only) blocks = blocks.filter(function(b){ return b.key === only; });
+  var t = 'Flower order' + (S.shop ? ' from ' + S.shop : '') + (only && blocks[0] && blocks[0].key !== '~none' ? ' for ' + blocks[0].sup : '') + '\n';
   if(S.pickup) t += 'Pickup/delivery: ' + fmtDate(S.pickup) + '\n';
   t += SUBS[S.subs] + '\n';
-  supplierBlocks(o.lines.filter(function(l){ return l.units > 0; })).forEach(function(blk){
-    if(blk.sup) t += '\n== ' + blk.sup + ' ==\n';
+  var units = {bunch: 0, box: 0, stem: 0};
+  blocks.forEach(function(blk){
+    blk.lines.forEach(function(l){ if(!l.noSize) units[l.unit] += l.units; });
+    if(blk.sup && !only) t += '\n== ' + blk.sup + ' ==\n';
     BO.GROUPS.forEach(function(g){
       var ls = blk.lines.filter(function(l){ return l.group === g; }); if(!ls.length) return;
       t += '\n' + g.toUpperCase() + '\n';
-      ls.forEach(function(l){ t += l.units + ' ' + unitWord(l.unit, l.units) + '  ' + l.name + (l.unit === 'stem' ? '' : ' (' + l.size + ' stems/' + l.unit + ')') + '\n'; });
+      ls.forEach(function(l){ t += l.noSize ? '?? ' + l.name + ': ' + l.toBuy + ' stems needed, ' + l.unit + ' size not set\n'
+        : l.units + ' ' + unitWord(l.unit, l.units) + '  ' + l.name + (l.unit === 'stem' ? '' : ' (' + l.size + ' stems/' + l.unit + ')') + '\n'; });
     });
   });
-  t += '\nTotal: ' + unitsText(o.units) + '\nThank you!\n';
+  t += '\nTotal: ' + unitsText(units) + '\nThank you!\n';
   return t;
 }
 function copy(text, ok){
@@ -754,7 +814,7 @@ function orderHTML(){
     h += '</tbody></table>';
   });
   h += '<p><b>Total: ' + esc(unitsText(o.units)) + (o.cost ? ' · ' + esc(money(o.cost)) : '') + '</b></p>';
-  if(evs.length > 1 && o.cost) h += '<h2>Flower cost per event (buffer and rounding included)</h2><table>' + o.events.map(function(x){ return '<tr><td>' + esc(x.name || 'Event') + (x.date ? ' · ' + esc(fmtDate(x.date)) : '') + '</td><td class="r">' + x.stems + ' stems</td><td class="r">' + esc(money(x.cost)) + '</td></tr>'; }).join('') + '</table>';
+  if(evs.length > 1 && o.cost) h += '<h2>Flower cost per event (buffer and rounding included)</h2><table>' + o.events.map(function(x){ return '<tr><td>' + esc(evLabel(S.events.filter(function(z){ return z.id === x.id; })[0])) + (x.date ? ' · ' + esc(fmtDate(x.date)) : '') + '</td><td class="r">' + x.stems + ' stems</td><td class="r">' + esc(money(x.cost)) + '</td></tr>'; }).join('') + '</table>';
   return h + foot();
 }
 function makeHTML(){
@@ -785,10 +845,22 @@ function findPiece(id){ var e = ev(); for(var i = 0; i < e.pieces.length; i++) i
 function rowRef(s){ var a = s.split(':'), p = findPiece(a[0]); return p ? {p: p, j: +a[1], r: p.recipe[+a[1]]} : null; }
 function nudgePro(why, what){ track('pro-limit'); track('limit-' + what); say(why); $('proSec').scrollIntoView({behavior: 'smooth'}); }
 function cloneRecipe(rc){ return rc.map(function(r){ return {f: r.f, n: r.n}; }); }
-function mergeFlower(from, into){   // every recipe that used `from` now uses `into`
+function mergeFlower(from, into){   // every recipe that used `from` now uses `into`; cooler stems add up; a missing supplier is taken over
+  if(from.onhand !== '' || into.onhand !== '') into.onhand = (+into.onhand || 0) + (+from.onhand || 0);
+  if(!String(into.supplier).trim()) into.supplier = from.supplier;
   S.events.forEach(function(e){ e.pieces.forEach(function(p){ p.recipe.forEach(function(r){ if(r.f === from.id) r.f = into.id; }); }); });
   S.book.forEach(function(b){ b.recipe.forEach(function(r){ if(r.f === from.id) r.f = into.id; }); });
   S.flowers = S.flowers.filter(function(f){ return f !== from; });
+}
+var pointerDown = false, pending = [];
+function later(fn){ if(pointerDown) pending.push(fn); else setTimeout(fn, 0); }   // keyboard: after Tab has moved focus; mouse: after the click
+function flushLater(){ var q = pending; pending = []; q.forEach(function(fn){ fn(); }); }
+document.addEventListener('pointerdown', function(){ pointerDown = true; }, true);
+document.addEventListener('pointerup', function(){ pointerDown = false; setTimeout(flushLater, 0); }, true);   // after the click has run
+document.addEventListener('pointercancel', function(){ pointerDown = false; setTimeout(flushLater, 0); }, true);
+function downloadBackup(prefix){
+  var blob = new Blob([JSON.stringify(S, null, 1)], {type: 'application/json'}), a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = prefix + new Date().toISOString().slice(0, 10) + '.json'; document.body.appendChild(a); a.click(); setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 500);
 }
 function intOrBlank(v, max){ return v === '' ? '' : Math.max(0, Math.min(max, Math.floor(+v) || 0)); }
 
@@ -799,7 +871,7 @@ document.addEventListener('input', function(e){
   if(d.pname){ x = findPiece(d.pname); if(x){ x.name = t.value.slice(0, 80); changed(); renderPad(); } return; }
   if(d.pqty){ x = findPiece(d.pqty); if(x){ x.qty = t.value === '' ? 0 : intOrBlank(t.value, 9999); changed(true); pieceStems(); renderPad(); } return; }
   if(d.rn){ x = rowRef(d.rn); if(x && x.r){ x.r.n = intOrBlank(t.value, 9999); changed(true); pieceStems(); renderPad(); } return; }
-  if(d.fsize){ x = flower(d.fsize); if(x){ x.size = t.value === '' ? '' : Math.max(1, Math.min(9999, Math.floor(+t.value) || 1)); x.ok = true; changed(true); renderPad(); var g = t.parentNode.querySelector('.guess'); if(g) g.remove(); } return; }
+  if(d.fsize){ x = flower(d.fsize); if(x){ var sz = Math.floor(+t.value); x.size = sz >= 2 ? Math.min(9999, sz) : ''; x.ok = true; changed(true); renderPad(); var g = t.parentNode.querySelector('.guess'); if(g) g.remove(); } return; }
   if(d.fprice){ x = flower(d.fprice); if(x){ x.price = t.value === '' || !(+t.value >= 0) ? '' : Math.min(99999, +t.value); changed(); renderPad(); } return; }
   if(d.fonhand){ x = flower(d.fonhand); if(x){ x.onhand = intOrBlank(t.value, 99999); changed(true); renderPad(); } return; }
   if(d.fbuf){ x = flower(d.fbuf); if(x){ x.buf = t.value === '' || !(+t.value >= 0) ? '' : Math.min(100, +t.value); changed(true); renderPad(); } return; }
@@ -821,36 +893,23 @@ document.addEventListener('change', function(e){
       if(!f){ f = newFlower(name); S.flowers.push(f); }
       x.r.f = f.id; if(t.value !== f.name) t.value = f.name;
     }
-    changed(true); keepFocus(renderFlowers); pieceStems(); renderPad(); return;
+    built = true; changed(true); pieceStems(); later(function(){ keepFocus(renderFlowers); renderPad(); }); return;
   }
   if(d.fname){   // renaming onto another flower's name merges the two
     x = flower(d.fname); if(!x) return;
     var nm = t.value.trim().replace(/\s+/g, ' ').slice(0, 80), other = nm ? S.flowers.filter(function(f){ return f !== x && BO.norm(f.name) === BO.norm(nm); })[0] : null;
+    if(!nm){ t.value = x.name; say('A flower needs a name. Kept "' + x.name + '".'); return; }
     if(other){
-      if(confirm('"' + other.name + '" is already in your list. Merge them? Recipes using either will use "' + other.name + '" with its bunch size and price.')){ mergeFlower(x, other); changed(true); }
+      if(confirm('"' + other.name + '" is already in your list. Merge them?\n\nRecipes using either will use "' + other.name + '" with its bunch size and price; cooler stems are added together.')){ mergeFlower(x, other); changed(true); }
       else { x.name = nm + ' (2)'; changed(); }
     } else { x.name = nm; changed(); }
-    setTimeout(function(){ keepFocus(function(){ renderFlowers(); renderSheet(); }); renderPad(); }, 0); return;   // after Tab has moved focus
+    later(function(){ keepFocus(function(){ renderFlowers(); renderSheet(); }); renderPad(); }); return;
   }
   if(d.fgroup){ x = flower(d.fgroup); if(x){ x.group = BO.GROUPS.indexOf(t.value) >= 0 ? t.value : 'flowers'; changed(); renderPad(); } return; }
-  if(d.funit){ x = flower(d.funit); if(x){ x.unit = BO.UNITS.indexOf(t.value) >= 0 ? t.value : 'bunch'; x.ok = true; if(x.unit !== 'stem' && !(+x.size >= 2)) x.size = ''; changed(true); setTimeout(function(){ keepFocus(renderFlowers); }, 0); renderPad(); } return; }
-  if(d.inorder){ S.inOrder[d.inorder] = t.checked; changed(true); renderPad(); return; }
-  if(d.pcopy){
-    var src = findPiece(d.pcopy), dest = t.value; t.value = ''; if(!src || !dest) return;
-    var cp = {id: uid('p'), name: src.name, qty: src.qty, recipe: cloneRecipe(src.recipe)}, target;
-    if(dest === '_new'){ target = newEvent(); target.pieces = []; S.events.push(target); trackOnce('event-2'); }
-    else target = S.events.filter(function(z){ return z.id === dest; })[0];
-    if(!target) return;
-    if(target === ev()){ cp.name = src.name ? src.name + ' (copy)' : ''; target.pieces.splice(target.pieces.indexOf(src) + 1, 0, cp); }
-    else target.pieces.push(cp);
-    changed(true); renderTabs(); renderSheet(); renderFlowers(); renderPad();
-    say(target === ev() ? 'Piece copied.' : 'Copied to ' + evLabel(target) + '.'); return;
-  }
-  if(t.id === 'selBook'){
-    var b = S.book.filter(function(z){ return z.id === t.value; })[0]; t.value = ''; if(!b) return;
-    ev().pieces.push({id: uid('p'), name: b.name, qty: 1, recipe: cloneRecipe(b.recipe)}); changed(true); renderSheet(); renderPad();
-    var qs = document.querySelectorAll('[data-pqty]'); if(qs.length){ qs[qs.length - 1].focus(); qs[qs.length - 1].select(); } return;
-  }
+  if(d.funit){ x = flower(d.funit); if(x){ x.unit = BO.UNITS.indexOf(t.value) >= 0 ? t.value : 'bunch';
+    if(x.unit === 'stem') x.size = 1; else if(x.unit === 'box'){ x.size = ''; x.ok = true; } else { x.size = BO.guessSale(x.name).unit === 'bunch' ? BO.guessSale(x.name).size : 10; x.ok = false; }
+    changed(true); later(function(){ keepFocus(renderFlowers); renderPad(); }); } return; }
+  if(d.inorder){ S.inOrder[d.inorder] = t.checked; pickedOrder = true; changed(true); renderPad(); return; }
   if(t.id === 'oPick'){ S.pickup = /^\d{4}-\d{2}-\d{2}$/.test(t.value) ? t.value : ''; changed(); return; }
   if(t.id === 'oSubs'){ S.subs = ['ok', 'ask', 'no'].indexOf(t.value) >= 0 ? t.value : 'ask'; changed(); return; }
 });
@@ -859,7 +918,7 @@ document.addEventListener('click', function(e){
   var d = t.dataset, x;
   if(d.tab){ S.sel = d.tab; save(); renderTabs(); renderSheet(); renderPad(); return; }
   if(t.id === 'btnAddEv'){
-    var ne = newEvent(); S.events.push(ne); S.sel = ne.id; changed(); trackOnce('event-2');
+    var ne = newEvent(); S.events.push(ne); S.sel = ne.id; built = true; changed(); trackOnce('event-2');
     renderTabs(); renderSheet(); renderPad(); $('evName').focus(); return;
   }
   if(t.id === 'btnDelEv'){
@@ -867,16 +926,35 @@ document.addEventListener('click', function(e){
     if(!confirm('Delete "' + evLabel(cur) + '" and its pieces? Your flower list and recipe book stay.')) return;
     S.events = S.events.filter(function(z){ return z !== cur; }); delete S.inOrder[cur.id]; S.sel = S.events[0].id; changed(true); renderAll(); return;
   }
-  if(t.id === 'btnAddPiece'){ ev().pieces.push({id: uid('p'), name: '', qty: 1, recipe: [{f: '', n: ''}]}); changed(true); renderSheet(); renderPad(); var ps = document.querySelectorAll('[data-pname]'); if(ps.length) ps[ps.length - 1].focus(); return; }
+  if(t.id === 'btnAddPiece'){ built = true; ev().pieces.push({id: uid('p'), name: '', qty: 1, recipe: [{f: '', n: ''}]}); changed(true); renderSheet(); renderPad(); var ps = document.querySelectorAll('[data-pname]'); if(ps.length) ps[ps.length - 1].focus(); return; }
   if(d.pdel){ x = findPiece(d.pdel); if(!x) return; var used = x.recipe.some(function(r){ return r.f && +r.n > 0; });
     if(used && !confirm('Remove "' + (x.name || 'this piece') + '"?')) return;
     ev().pieces = ev().pieces.filter(function(p){ return p !== x; }); changed(true); renderSheet(); renderFlowers(); renderPad(); return; }
+  if(d.pcopy){
+    var src = findPiece(d.pcopy), sel = document.querySelector('[data-pcopyto="' + d.pcopy + '"]'), dest = sel ? sel.value : ''; if(!src || !dest) return;
+    var cp = {id: uid('p'), name: src.name, qty: src.qty, recipe: cloneRecipe(src.recipe)}, target;
+    if(dest === '_new'){ target = newEvent(); target.pieces = []; S.events.push(target); trackOnce('event-2'); }
+    else target = S.events.filter(function(z){ return z.id === dest; })[0];
+    if(!target) return;
+    if(target === ev()){ cp.name = src.name ? src.name + ' (copy)' : ''; target.pieces.splice(target.pieces.indexOf(src) + 1, 0, cp); }
+    else target.pieces.push(cp);
+    built = true; changed(true); keepFocus(function(){ renderTabs(); renderSheet(); }); renderFlowers(); renderPad();
+    say(target === ev() ? 'Piece copied.' : 'Copied to ' + evLabel(target) + '.'); return;
+  }
+  if(t.id === 'btnBookAdd' || t.id === 'btnBookDel'){
+    var bk = S.book.filter(function(z){ return z.id === $('selBook').value; })[0]; if(!bk) return;
+    if(t.id === 'btnBookDel'){ if(!confirm('Remove "' + bk.name + '" from your recipe book? Pieces already in your events stay.')) return; S.book = S.book.filter(function(z){ return z !== bk; }); changed(); renderSheet(); renderFlowers(); return; }
+    ev().pieces.push({id: uid('p'), name: bk.name, qty: 1, recipe: cloneRecipe(bk.recipe)}); built = true; changed(true); renderSheet(); renderPad();
+    var qs = document.querySelectorAll('[data-pqty]'); if(qs.length){ qs[qs.length - 1].focus(); qs[qs.length - 1].select(); } return;
+  }
   if(d.pbook){
     x = findPiece(d.pbook); if(!x) return;
     var rc = x.recipe.filter(function(r){ return r.f && +r.n > 0; }); if(!rc.length){ say('Add flowers to this piece first.'); return; }
     var same = x.name.trim() ? S.book.filter(function(b){ return BO.norm(b.name) === BO.norm(x.name); })[0] : null;
     if(!same && !isPro() && S.book.length >= FREE_BOOK){ nudgePro('The free recipe book keeps ' + FREE_BOOK + ' recipes. Pro keeps all of them.', 'book'); return; }
-    if(same){ if(!confirm('Replace "' + same.name + '" in your recipe book with this version?')) return; same.recipe = cloneRecipe(rc); }
+    if(same && confirm('Your recipe book already has "' + same.name + '".\n\nOK replaces it with this version. Cancel keeps both.')){ same.recipe = cloneRecipe(rc); }
+    else if(same && !isPro() && S.book.length >= FREE_BOOK){ nudgePro('The free recipe book keeps ' + FREE_BOOK + ' recipes. Pro keeps all of them.', 'book'); return; }
+    else if(same) S.book.push({id: uid('b'), name: x.name.trim() + ' (' + (S.book.length + 1) + ')', recipe: cloneRecipe(rc)});
     else S.book.push({id: uid('b'), name: x.name.trim() || 'Recipe ' + (S.book.length + 1), recipe: cloneRecipe(rc)});
     track('book-save'); changed(); renderSheet(); say('Saved to your recipe book. Add it to any event with "+ From recipe book".'); return;
   }
@@ -885,23 +963,31 @@ document.addEventListener('click', function(e){
   if(d.fdel){ S.flowers = S.flowers.filter(function(f){ return f.id !== d.fdel; }); changed(); renderFlowers(); return; }
   if(d.openfl){ $('flist').open = true; $('flist').scrollIntoView({behavior: 'smooth'}); return; }
   if(d.gopro){ if(d.gopro === 'combine'){ track('pro-limit'); track('limit-combine'); } $('proSec').scrollIntoView({behavior: 'smooth'}); return; }
-  if(t.id === 'btnBlank'){ S = blank(); touched = true; trackOnce('tool-start'); save(); renderAll(); $('evName').focus(); return; }
-  if(t.id === 'btnCopy'){ if(!lastOrder || !lastOrder.lines.length) return; renderPad(); track('copy-order'); trackOnce('order-used'); copy(orderText(), 'Order copied. Paste it into a text or email to your wholesaler.'); return; }
+  if(t.id === 'btnBlank'){ S = blank(); touched = true; built = true; trackOnce('tool-start'); save(); renderAll(); $('evName').focus(); return; }
+  if(t.id === 'btnNewWeek'){
+    if(!confirm('Start next week?\n\nThis clears your ' + S.events.length + ' event' + (S.events.length > 1 ? 's' : '') + ' and the pickup date. Your flowers, prices and recipe book stay.\nA backup of this week downloads first.')) return;
+    downloadBackup('bunch-order-week-'); var e0 = newEvent(); S.events = [e0]; S.sel = e0.id; S.inOrder = {}; S.pickup = ''; S.example = false;
+    built = true; touched = true; track('new-week'); save(); renderAll(); $('evName').focus(); say('New week. Check what is in your cooler under Your flowers.'); return;
+  }
+  if(t.id === 'btnCopy' || d.copysup){
+    if(!lastOrder || !lastOrder.lines.length) return; var key = d.copysup || ''; flushLater(); renderPad();
+    track('copy-order'); trackOnce('order-used');
+    var blk = key ? supplierBlocks(lastOrder.lines).filter(function(bl){ return bl.key === key; })[0] : null;
+    var miss = (blk ? blk.lines : lastOrder.lines).filter(function(l){ return l.noSize; }).length;
+    var to = blk && key !== '~none' ? blk.sup : 'your wholesaler';
+    copy(orderText(key), miss ? 'Copied, but ' + miss + ' flower' + (miss > 1 ? 's have' : ' has') + ' no bunch size yet: marked ?? in the text.' : 'Order copied. Paste it into a text or email to ' + to + '.'); return;
+  }
   if(t.id === 'btnPrint'){ if(!lastOrder || !lastOrder.lines.length) return; track('print-order'); doPrint('order'); return; }
   if(t.id === 'btnMake'){ if(!lastOrder || !lastOrder.lines.length) return; track('print-make'); doPrint('make'); return; }
   if(t.id === 'btnBuy'){ track('buy-click'); return; }   // opens Whop in a new tab, so the queued hits still leave from this one
   if(t.id === 'btnUnlock'){ unlock(); return; }
   if(t.id === 'btnHow'){ $('howSec').scrollIntoView({behavior: 'smooth'}); return; }
   if(t.id === 'btnToPad'){ $('pad').scrollIntoView({behavior: 'smooth'}); return; }
-  if(t.id === 'btnBackup' || t.id === 'btnBackupTop'){
-    track('backup');
-    var blob = new Blob([JSON.stringify(S, null, 1)], {type: 'application/json'}), a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = 'bunch-order-backup-' + new Date().toISOString().slice(0, 10) + '.json'; document.body.appendChild(a); a.click(); setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 500); return;
-  }
+  if(t.id === 'btnBackup' || t.id === 'btnBackupTop'){ track('backup'); downloadBackup('bunch-order-backup-'); return; }
   if(t.id === 'btnRestore'){
     var f = document.createElement('input'); f.type = 'file'; f.accept = '.json,application/json';
     f.onchange = function(){ var rd = new FileReader(); rd.onload = function(){ try{ var o = JSON.parse(rd.result); if(!valid(o)) throw 0;
-      if(!S.example && !confirm('Replace what is in Bunch Order now with this backup?')) return; o.example = false; S = o; touched = true; save(); renderAll(); track('restore'); say('Backup restored.'); }catch(err){ say('That file is not a Bunch Order backup.'); } }; if(f.files[0]) rd.readAsText(f.files[0]); };
+      if(!S.example && !confirm('Replace what is in Bunch Order now with this backup?')) return; o.example = false; S = o; touched = true; built = true; save(); renderAll(); track('restore'); say('Backup restored.'); }catch(err){ say('That file is not a Bunch Order backup.'); } }; if(f.files[0]) rd.readAsText(f.files[0]); };
     f.click(); return;
   }
 });
@@ -915,14 +1001,19 @@ window.addEventListener('storage', function(e){   // another tab saved: take it,
 });
 
 renderAll();
-try{ var seenPro = false; new IntersectionObserver(function(es){ es.forEach(function(x){ if(x.isIntersecting && !seenPro && !isPro() && (touched || window.scrollY > 300)){ seenPro = true; track('pro-view'); } }); }).observe($('proSec')); }catch(e){}
-if(GC_CODE){ var gs = document.createElement('script'); gs.async = true; gs.src = '//gc.zgo.at/count.js'; gs.setAttribute('data-goatcounter', 'https://' + GC_CODE + '.goatcounter.com/count'); document.head.appendChild(gs); }
+try{ var seenPro = false; new IntersectionObserver(function(es){ es.forEach(function(x){ if(x.isIntersecting && !seenPro && !isPro() && !autoScrolled && (touched || window.scrollY > 300)){ seenPro = true; track('pro-view'); } }); }).observe($('proSec')); }catch(e){}
+window.addEventListener('wheel', function(){ autoScrolled = false; }, {passive: true}); window.addEventListener('touchmove', function(){ autoScrolled = false; }, {passive: true});
+if(GC_CODE){ var gs = document.createElement('script'); gs.async = true; gs.src = '//gc.zgo.at/count.js'; gs.setAttribute('data-goatcounter', 'https://' + GC_CODE + '.goatcounter.com/count');
+  if(SELFTEST) gs.setAttribute('data-goatcounter-settings', '{"no_onload":true}');   // self-test: no untagged pageview either
+  document.head.appendChild(gs); }
 (function(){
   var q = new URLSearchParams(location.search);
   var via = (q.get('via') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 20), af = (q.get('a') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
-  if(via) track('via-' + via);
-  if(af) track('aff-' + af);
-  if(q.get('bought') === '1' && !isPro()) setTimeout(function(){ $('proSec').scrollIntoView(); var k = $('proKey'); if(k) k.focus(); }, 400);
+  function oncePerVisit(n){ try{ if(sessionStorage.getItem('bo.seen.' + n)) return; sessionStorage.setItem('bo.seen.' + n, '1'); }catch(e){} track(n); }   // a reload is not a new visit
+  if(via) oncePerVisit('via-' + via);
+  if(af) oncePerVisit('aff-' + af);
+  if(q.get('bought') === '1'){ oncePerVisit('bought-return');
+    if(!isPro()){ autoScrolled = true; setTimeout(function(){ $('proSec').scrollIntoView(); var k = $('proKey'); if(k) k.focus(); }, 400); } }
   if(SELFTEST && q.get('fire') === 'all'){   // live measurement check only: every funnel event once, as "<event>.selftest..."
     Object.keys(FUNNEL_EV).forEach(function(n){ track(n); });
   }
