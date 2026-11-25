@@ -215,6 +215,11 @@ footer{padding:20px 16px 90px;font-size:14px}
     <h2>Bunch Order Pro</h2>
     <div id="proBody"></div>
   </div>
+  <div class="card share" id="shareSec">
+    <h2>Pass it on</h2>
+    <p>Know another florist who orders for several events a week? Send them the page.</p>
+    <button class="btn small" id="btnShare">Copy a link to send</button>
+  </div>
   <div class="card how" id="howSec">
     <h2>How it counts</h2>
     <p><b>Stems needed</b> = for every piece, how many you're making times the stems in its recipe, added up across the events in the order.</p>
@@ -426,13 +431,26 @@ var SRC = (function(){ try{
   return sessionStorage.getItem('bo.src') || '';
 }catch(e){ return ''; } })();
 var SELFTEST = SRC.indexOf('selftest') === 0;
-/* 11-25 FACTORY rule 7: every letter has its own link, ?via=<batch>-<recipient> (e.g. bo2-e3f1a). Funnel events carry the batch
-   (".bo2", what the ledger tests read); the few that show a recipient's people used the tool also carry the full code. */
-var GROUP = SRC.split('-')[0], PER = SRC.indexOf('-') > 0 ? SRC : '';
-var PER_EV = {'tool-start':1, 'order-made':1, 'pro-gift':1, 'buy-click':1, 'bought-return':1};
+/* 11-25 FACTORY rule 7: every letter has its own link, ?via=<batch>-<recipient> (e.g. bo2-e3f1a), and the page's "Pass it on"
+   button hands out <batch>-<recipient>-s. A -s visit from a browser that already came in on the recipient's own code is the
+   recipient themselves (counted as their own visit); from any other browser it fires via-<code>-s, the ledger's "share visit".
+   Funnel events carry the batch (".bo2" letter readers, ".bo2s" people they passed it to); the few that show use also carry the
+   full code, so each recipient's people can be traced. Same scheme as bond-hours (bizz-n09). */
+var VIA_EV = [];
+(function(){
+  var m = /^([a-z]+[0-9]+)-([a-z0-9]{4,6})(-s)?$/.exec(SRC); if(!m) return;
+  var me = m[1] + '-' + m[2], own = lsGet('bo.own', []); if(!Array.isArray(own)) own = [];
+  var fresh = (function(){ try{ return !!new URLSearchParams(location.search).get('via'); }catch(e){ return false; } })();
+  if(m[3] && own.indexOf(me) >= 0){ SRC = me; try{ sessionStorage.setItem('bo.src', SRC); }catch(e){} }   // own share link: their own visit
+  if(SRC === me && own.indexOf(me) < 0){ own.push(me); lsSet('bo.own', own.slice(-5)); }
+  if(fresh) VIA_EV = SRC === me ? ['via-' + m[1], 'via-' + me] : ['via-' + m[1] + 's', 'via-' + SRC];
+})();
+var GROUP = (function(){ var m = /^([a-z]+[0-9]+)-[a-z0-9]{4,6}(-s)?$/.exec(SRC); return m ? m[1] + (m[2] ? 's' : '') : SRC; })();
+var PER = GROUP !== SRC ? SRC : '';
+var PER_EV = {'tool-start':1, 'order-made':1, 'pro-gift':1, 'buy-click':1, 'bought-return':1, 'share-copy':1};
 var FUNNEL_EV = {'tool-start':1, 'order-made':1, 'event-2':1, 'order-used':1, 'copy-order':1, 'print-order':1, 'print-make':1,
                  'savings-shown':1, 'pro-view':1, 'pro-limit':1, 'limit-book':1, 'limit-combine':1, 'buy-click':1, 'bought-return':1,
-                 'pro-unlocked':1, 'pro-notfound':1, 'pro-gift':1, 'combine-used':1, 'book-save':1, 'new-week':1};
+                 'pro-unlocked':1, 'pro-notfound':1, 'pro-gift':1, 'combine-used':1, 'book-save':1, 'new-week':1, 'share-copy':1};
 var ONCE = {}, QUEUE = [], SENDING = false, GC_READY = 0;
 function track(name){
   try{
@@ -977,6 +995,8 @@ document.addEventListener('click', function(e){
   if(d.fdel){ S.flowers = S.flowers.filter(function(f){ return f.id !== d.fdel; }); changed(); renderFlowers(); return; }
   if(d.openfl){ $('flist').open = true; $('flist').scrollIntoView({behavior: 'smooth'}); return; }
   if(d.gopro){ if(d.gopro === 'combine'){ track('pro-limit'); track('limit-combine'); } $('proSec').scrollIntoView({behavior: 'smooth'}); return; }
+  if(t.id === 'btnShare'){ var own = lsGet('bo.own', []), me = Array.isArray(own) && own.length ? own[own.length - 1] : '';
+    copy('https://samsbench.com/bunch-order/?via=' + (me ? me + '-s' : 'share'), 'Link copied. Paste it into an email or message.'); trackOnce('share-copy'); return; }
   if(t.id === 'btnBlank'){ S = blank(); touched = true; built = true; trackOnce('tool-start'); save(); renderAll(); $('evName').focus(); return; }
   if(t.id === 'btnNewWeek'){
     if(!confirm('Start next week?\n\nThis clears your ' + S.events.length + ' event' + (S.events.length > 1 ? 's' : '') + ' and the pickup date. Your flowers, prices and recipe book stay.\nA backup of this week downloads first.')) return;
@@ -1024,7 +1044,7 @@ if(GC_CODE){ var gs = document.createElement('script'); gs.async = true; gs.src 
   var q = new URLSearchParams(location.search);
   var via = (q.get('via') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 20), af = (q.get('a') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
   function oncePerVisit(n){ try{ if(sessionStorage.getItem('bo.seen.' + n)) return; sessionStorage.setItem('bo.seen.' + n, '1'); }catch(e){} track(n); }   // a reload is not a new visit
-  if(via){ if(via.indexOf('-') > 0) oncePerVisit('via-' + via.split('-')[0]); oncePerVisit('via-' + via); }   // batch visits + this recipient's visits
+  if(VIA_EV.length) VIA_EV.forEach(oncePerVisit); else if(via) oncePerVisit('via-' + via);   // per-recipient: batch visit + this recipient's (or their share link's) visit
   if(af) oncePerVisit('aff-' + af);
   if(q.get('bought') === '1'){ oncePerVisit('bought-return');
     if(!isPro()){ autoScrolled = true; setTimeout(function(){ $('proSec').scrollIntoView(); var k = $('proKey'); if(k) k.focus(); }, 400); } }
