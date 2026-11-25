@@ -426,14 +426,18 @@ var SRC = (function(){ try{
   return sessionStorage.getItem('bo.src') || '';
 }catch(e){ return ''; } })();
 var SELFTEST = SRC.indexOf('selftest') === 0;
+/* 11-25 FACTORY rule 7: every letter has its own link, ?via=<batch>-<recipient> (e.g. bo2-e3f1a). Funnel events carry the batch
+   (".bo2", what the ledger tests read); the few that show a recipient's people used the tool also carry the full code. */
+var GROUP = SRC.split('-')[0], PER = SRC.indexOf('-') > 0 ? SRC : '';
+var PER_EV = {'tool-start':1, 'order-made':1, 'pro-gift':1, 'buy-click':1, 'bought-return':1};
 var FUNNEL_EV = {'tool-start':1, 'order-made':1, 'event-2':1, 'order-used':1, 'copy-order':1, 'print-order':1, 'print-make':1,
                  'savings-shown':1, 'pro-view':1, 'pro-limit':1, 'limit-book':1, 'limit-combine':1, 'buy-click':1, 'bought-return':1,
                  'pro-unlocked':1, 'pro-notfound':1, 'pro-gift':1, 'combine-used':1, 'book-save':1, 'new-week':1};
 var ONCE = {}, QUEUE = [], SENDING = false, GC_READY = 0;
 function track(name){
   try{
-    if(SELFTEST){ QUEUE.push(name.indexOf('via-') === 0 ? name : name + '.' + SRC); drain(); return; }
-    if(SRC && FUNNEL_EV[name]) QUEUE.push(name + '.' + SRC);
+    if(SRC && FUNNEL_EV[name]){ QUEUE.push(name + '.' + GROUP); if(PER && PER_EV[name]) QUEUE.push(name + '.' + PER); }
+    if(SELFTEST){ if(name.indexOf('via-') === 0) QUEUE.push(name); else if(!FUNNEL_EV[name]) QUEUE.push(name + '.' + SRC); drain(); return; }   // self-test: tagged names only
     QUEUE.push(name); drain();
   }catch(e){}
 }
@@ -1020,7 +1024,7 @@ if(GC_CODE){ var gs = document.createElement('script'); gs.async = true; gs.src 
   var q = new URLSearchParams(location.search);
   var via = (q.get('via') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 20), af = (q.get('a') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
   function oncePerVisit(n){ try{ if(sessionStorage.getItem('bo.seen.' + n)) return; sessionStorage.setItem('bo.seen.' + n, '1'); }catch(e){} track(n); }   // a reload is not a new visit
-  if(via) oncePerVisit('via-' + via);
+  if(via){ if(via.indexOf('-') > 0) oncePerVisit('via-' + via.split('-')[0]); oncePerVisit('via-' + via); }   // batch visits + this recipient's visits
   if(af) oncePerVisit('aff-' + af);
   if(q.get('bought') === '1'){ oncePerVisit('bought-return');
     if(!isPro()){ autoScrolled = true; setTimeout(function(){ $('proSec').scrollIntoView(); var k = $('proKey'); if(k) k.focus(); }, 400); } }
